@@ -1,4 +1,4 @@
-# HetrixTools Windows Server Monitoring Agent
+# HetrixTools macos Server Monitoring Agent
 
 Documentation available here: https://docs.hetrixtools.com/category/server-monitor/
 
