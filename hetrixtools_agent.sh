@@ -161,7 +161,8 @@ if [ -n "$OutgoingPings" ]; then
 	OLD_IFS="$IFS"
 	IFS='|'
 	for i in $OutgoingPings; do
-		IFS=',' read TargetName TargetIP <<< "$i"
+		TargetName=${i%%,*}
+		TargetIP=${i#*,}
 		bash "$ScriptPath"/hetrixtools_agent.sh ping "$TargetName" "$TargetIP" &
 	done
 	IFS="$OLD_IFS"
@@ -281,6 +282,7 @@ for disk in $IOPS_DISK_LIST; do
 	kv_set "iops_mnt" "$disk" "/"
 done
 # Parse df mounts and trace each back to its physical disk
+df -l 2>/dev/null | awk 'NR>1 && /\/dev\/disk/{print $1, $NF}' > "$KV_DIR/df_mounts"
 while read -r dev mnt; do
 	# Extract base disk identifier (e.g., disk3 from /dev/disk3s1s1)
 	base=$(echo "$dev" | sed 's|/dev/||; s/s[0-9].*//')
@@ -295,7 +297,7 @@ while read -r dev mnt; do
 			kv_set "iops_mnt" "$phys" "$mnt"
 			;;
 	esac
-done <<< "$(df -l 2>/dev/null | awk 'NR>1 && /\/dev\/disk/{print $1, $NF}')"
+done < "$KV_DIR/df_mounts"
 
 if [ "$DEBUG" -eq 1 ]; then
 	for disk in $IOPS_DISK_LIST; do
@@ -515,29 +517,39 @@ if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) RAM Size: $RA
 # Disks usage
 DISKs=""
 if [ -n "$(df -T -b 2>/dev/null)" ]; then
+	df -T -b 2>/dev/null | sed 1d | grep -v -E 'devfs|tmpfs|map |/System/Volumes/' > "$KV_DIR/df_disks"
 	while IFS= read -r line; do
-		mount_point=$(echo "$line" | awk '{for(i=9;i<=NF;i++) printf "%s"(i<NF?" ":""), $i; print ""}')
-		fs_type=$(echo "$line" | awk '{print $2}')
-		total_size=$(echo "$line" | awk '{print $3}')
-		used_size=$(echo "$line" | awk '{print $4}')
-		avail_size=$(echo "$line" | awk '{print $5}')
+		fields=($line)
+		fs_type=${fields[1]}
+		total_size=${fields[2]}
+		used_size=${fields[3]}
+		avail_size=${fields[4]}
+		mount_point=""
+		if [ "${#fields[@]}" -ge 9 ]; then
+			mount_point="${fields[*]:8}"
+		fi
 		if [ -n "$mount_point" ] && [ -n "$total_size" ]; then
 			DISKs="$DISKs$mount_point,$fs_type,$total_size,$used_size,$avail_size;"
 		fi
-	done <<< "$(df -T -b 2>/dev/null | sed 1d | grep -v -E 'devfs|tmpfs|map |/System/Volumes/')"
+	done < "$KV_DIR/df_disks"
 else
+	df -b 2>/dev/null | sed 1d | grep -v -E 'devfs|tmpfs|map |/System/Volumes/' > "$KV_DIR/df_disks"
 	while IFS= read -r line; do
-		mount_point=$(echo "$line" | awk '{for(i=6;i<=NF;i++) printf "%s"(i<NF?" ":""), $i; print ""}')
-		total_size=$(echo "$line" | awk '{print $2 * 512}')
-		used_size=$(echo "$line" | awk '{print $3 * 512}')
-		avail_size=$(echo "$line" | awk '{print $4 * 512}')
+		fields=($line)
+		total_size=$(( ${fields[1]:-0} * 512 ))
+		used_size=$(( ${fields[2]:-0} * 512 ))
+		avail_size=$(( ${fields[3]:-0} * 512 ))
+		mount_point=""
+		if [ "${#fields[@]}" -ge 6 ]; then
+			mount_point="${fields[*]:5}"
+		fi
 		# Detect filesystem type from mount point
-		fs_type=$(mount 2>/dev/null | grep " on $mount_point " | awk -F'[()]' '{print $2}' | awk -F',' '{print $1}')
+		fs_type=$(mount 2>/dev/null | grep " on $mount_point " | sed -E "s/.*\\(([^,)]*).*/\\1/" | head -1)
 		fs_type=${fs_type:-apfs}
 		if [ -n "$mount_point" ] && [ -n "$total_size" ]; then
 			DISKs="$DISKs$mount_point,$fs_type,$total_size,$used_size,$avail_size;"
 		fi
-	done <<< "$(df -b 2>/dev/null | sed 1d | grep -v -E 'devfs|tmpfs|map |/System/Volumes/')"
+	done < "$KV_DIR/df_disks"
 fi
 DISKs=$(echo -ne "$DISKs" | base64 | tr -d '\n\r\t ')
 
@@ -545,15 +557,20 @@ if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) DISKs encoded
 
 # Disk inodes
 INODEs=""
+df -i 2>/dev/null | sed 1d | grep -v -E 'devfs|tmpfs|map |/System/Volumes/' > "$KV_DIR/df_inodes"
 while IFS= read -r line; do
-	mount_point=$(echo "$line" | awk '{for(i=9;i<=NF;i++) printf "%s"(i<NF?" ":""), $i; print ""}')
-	iused=$(echo "$line" | awk '{print $6}')
-	ifree=$(echo "$line" | awk '{print $7}')
+	fields=($line)
+	iused=${fields[5]:-0}
+	ifree=${fields[6]:-0}
 	itotal=$((iused + ifree))
+	mount_point=""
+	if [ "${#fields[@]}" -ge 9 ]; then
+		mount_point="${fields[*]:8}"
+	fi
 	if [ -n "$mount_point" ]; then
 		INODEs="$INODEs$mount_point,$itotal,$iused,$ifree;"
 	fi
-done <<< "$(df -i 2>/dev/null | sed 1d | grep -v -E 'devfs|tmpfs|map |/System/Volumes/')"
+done < "$KV_DIR/df_inodes"
 INODEs=$(echo -ne "$INODEs" | base64 | tr -d '\n\r\t ')
 
 # Disk IOPS
@@ -669,7 +686,16 @@ if [ "${CheckDriveHealth:-0}" -gt 0 ]; then
 		for disk in $(diskutil list 2>/dev/null | grep "^/dev/disk[0-9]" | grep "physical\|external" | awk '{print $1}' | sort -u); do
 			DHealth=$(smartctl -A "$disk" 2>/dev/null)
 			if [ -n "$DHealth" ] && echo "$DHealth" | grep -q -E 'Attribute|SMART'; then
-				DHHealth=$(smartctl -H "$disk" 2>/dev/null)
+				# Retry smartctl -H up to 3 times on IOKit failures (transient macOS issue)
+				DHHealth=""
+				for retry in 1 2 3; do
+					DHHealth=$(smartctl -H "$disk" 2>&1)
+					if echo "$DHHealth" | grep -q "PASSED\|FAILED"; then
+						break
+					fi
+					if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) smartctl -H $disk retry $retry" >> "$ScriptPath"/debug.log; fi
+					sleep 0.5
+				done
 				DHealth="$DHHealth\n$DHealth"
 				DHealth=$(echo -ne "$DHealth" | base64 | tr -d '\n\r\t ')
 				DInfo=$(smartctl -i "$disk" 2>/dev/null)
